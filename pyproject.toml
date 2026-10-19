@@ -1,0 +1,8 @@
+[project]
+name = "library-api"
+version = "1.0.0"
+description = "A library API built with FastAPI "
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+]
