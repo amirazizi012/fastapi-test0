@@ -1,9 +1,19 @@
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Library API")
+from db import get_conn, init_db
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()  # runs once when the server starts
+    yield
+
+
+app = FastAPI(title="Library API", lifespan=lifespan)
 
 
 class BookIn(BaseModel):
@@ -16,48 +26,55 @@ class BookUpdate(BaseModel):
     author: Optional[str] = None
 
 
-
-books = {
-    1: {"title": "Clean Code", "author": "Robert C. Martin"},
-    2: {"title": "The Pragmatic Programmer", "author": "Andrew Hunt"},
-    3: {"title": "Introduction to Algorithms", "author": "Thomas H. Cormen"},
-    4: {"title": "Design Patterns", "author": "Erich Gamma"},
-}
-next_id = 5
-
-
-def get_or_404(book_id: int):
-    if book_id not in books:
+def get_or_404(conn, book_id: int):
+    book = conn.execute(
+        "SELECT id, title, author FROM books WHERE id = %s", (book_id,)
+    ).fetchone()
+    if book is None:
         raise HTTPException(status_code=404, detail="Book not found")
-    return books[book_id]
+    return book
 
 
 @app.get("/books")
 def list_books():
-    return [{"id": i, **b} for i, b in books.items()]
+    with get_conn() as conn:
+        return conn.execute("SELECT id, title, author FROM books ORDER BY id").fetchall()
 
 
 @app.post("/books", status_code=201)
 def create_book(book: BookIn):
-    global next_id
-    books[next_id] = book.model_dump()
-    next_id += 1
-    return {"id": next_id - 1, **books[next_id - 1]}
+    with get_conn() as conn:
+        return conn.execute(
+            "INSERT INTO books (title, author) VALUES (%s, %s) "
+            "RETURNING id, title, author",
+            (book.title, book.author),
+        ).fetchone()
 
 
 @app.get("/books/{book_id}")
 def get_book(book_id: int):
-    return {"id": book_id, **get_or_404(book_id)}
+    with get_conn() as conn:
+        return get_or_404(conn, book_id)
 
 
 @app.patch("/books/{book_id}")
 def update_book(book_id: int, changes: BookUpdate):
-    book = get_or_404(book_id)
-    book.update(changes.model_dump(exclude_unset=True))
-    return {"id": book_id, **book}
+    with get_conn() as conn:
+        book = get_or_404(conn, book_id)
+        # only the fields the client sent (and not null)
+        data = {k: v for k, v in changes.model_dump(exclude_unset=True).items() if v is not None}
+        if not data:
+            return book
+        # the keys come from the BookUpdate model, never from user text
+        columns = ", ".join(f"{key} = %s" for key in data)
+        return conn.execute(
+            f"UPDATE books SET {columns} WHERE id = %s RETURNING id, title, author",
+            (*data.values(), book_id),
+        ).fetchone()
 
 
 @app.delete("/books/{book_id}", status_code=204)
 def delete_book(book_id: int):
-    get_or_404(book_id)
-    del books[book_id]
+    with get_conn() as conn:
+        get_or_404(conn, book_id)
+        conn.execute("DELETE FROM books WHERE id = %s", (book_id,))
